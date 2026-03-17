@@ -9,6 +9,9 @@
 cortex-proxy.toml
 config.toml
 
+# Old architecture image (kept locally, not in repo)
+architecture_ai_layer_old.jpg
+
 # Logs
 *.log
 

@@ -17,7 +17,7 @@ A high-performance Rust proxy that lets any AI coding agent (Claude Code, OpenCo
 - Combine with Snowflake MCP server for native data access
 - Centralized billing across all Snowflake-supported models
 
-![Architecture](architecture_ai_layer.jpg)
+![Architecture](architecture_ai_layer.png)
 
 ---
 
