@@ -384,6 +384,22 @@ examples = [
 
 Restart the proxy to pick up changes.
 
+#### Policy Rejection Examples
+
+When a prompt triggers a policy violation with `action = "block"`, the client receives an HTTP 403 with the rule name and matched pattern. Here's how it looks across different clients:
+
+**Claude Code** — prompt injection blocked at the pattern-matching tier (near-zero latency):
+
+![Claude Code policy rejection](claude_rejected_sample.png)
+
+**OpenCode** — normal query succeeds (13.4s), then injection attempt blocked in 429ms:
+
+![OpenCode policy rejection](opencode_rejected.png)
+
+**ZeroClaw** — injection attempt blocked immediately by pattern matching:
+
+![ZeroClaw policy rejection](zeroclaw_rejected.png)
+
 ---
 
 ### Policy Server (Optional)
@@ -683,7 +699,7 @@ pixi run cargo build --release --manifest-path cortex-proxy-rs/Cargo.toml
 
 ```
 cortex-proxy-rs/           # Rust source
-├── src/main.rs            # All proxy logic (~2100 lines)
+├── src/main.rs            # All proxy logic (~1300 lines)
 ├── Cargo.toml
 ├── target/release/        # Compiled binary
 cortex-proxy.example.toml  # Template config
