@@ -1,6 +1,6 @@
 ## Snowflake Cortex AI Agent Compatibility Proxy
 
-A high-performance Rust proxy that lets any AI coding agent (Claude Code, OpenCode, Continue.dev, Mistral Vibe, etc.) use Snowflake Cortex AI models.
+A high-performance Rust proxy that lets any AI coding agent (Claude Code, OpenCode, ZeroClaw, Continue.dev, Mistral Vibe, etc.) use Snowflake Cortex AI models.
 
 ### What it does
 
@@ -8,7 +8,7 @@ A high-performance Rust proxy that lets any AI coding agent (Claude Code, OpenCo
 
 2. **Agent API Proxying** — Proxies Snowflake's Cortex Agent API (`/agent:run`), handling the PAT-to-session-token exchange automatically. Also provides translation endpoints that accept Anthropic or OpenAI format and route through the Agent API.
 
-3. **Policy Enforcement** — Intercepts prompts before they reach the LLM and evaluates them against configurable security policies using a Cortex judge model. Blocks prompt injection, data exfiltration attempts, unauthorized tool use, and other threats.
+3. **Policy Enforcement (Optional)** — When enabled, intercepts prompts on **all routes** before they reach the LLM and evaluates them against configurable security policies. Uses a two-tier approach: fast pattern matching first, then a Cortex judge model for deeper evaluation. Blocks prompt injection, data exfiltration attempts, unauthorized tool use, and other threats. **Omit the `[policy]` section entirely to run as a pure API proxy with no policy overhead.**
 
 ### Why use this
 
@@ -25,7 +25,7 @@ A high-performance Rust proxy that lets any AI coding agent (Claude Code, OpenCo
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│  AI Client (Claude Code, Continue.dev, Cursor, OpenAI SDK, etc.)    │
+│  AI Client (Claude Code, OpenCode, ZeroClaw, Continue.dev, etc.)    │
 └─────────┬───────────┬───────────┬──────────┬──────────┬─────────────┘
           │           │           │          │          │
   Anthropic API   OpenAI API   OpenAI API  Anthropic  agent:run
@@ -37,9 +37,9 @@ A high-performance Rust proxy that lets any AI coding agent (Claude Code, OpenCo
 │                         CORTEX PROXY (port 8766)                     │
 │                                                                      │
 │  ┌────────────────────────────────────────────────────────────────┐  │
-│  │                    Policy Enforcement Engine                    │  │
-│  │  Evaluates every agent:run prompt against 6 security rules     │  │
-│  │  using a Cortex judge model (chat/completions API)             │  │
+│  │              Policy Enforcement Engine (optional)               │  │
+│  │  Two-tier: pattern matching (fast) → judge model (thorough)    │  │
+│  │  Evaluates prompts on ALL routes against configurable rules    │  │
 │  │  Actions: BLOCK (HTTP 403) | WARN (log + allow) | LOG          │  │
 │  └────────────────────────────────────────────────────────────────┘  │
 │                                                                      │
@@ -71,12 +71,14 @@ A high-performance Rust proxy that lets any AI coding agent (Claude Code, OpenCo
 | Route | Method | Input Format | Backend | Auth Mode | Policy |
 |---|---|---|---|---|---|
 | `/health` | GET | — | Local | None | No |
-| `/v1/messages` | POST | Anthropic Messages API | `chat/completions` | PAT (auto) | No |
-| `/v1/chat/completions` | POST | OpenAI Chat API | `chat/completions` | PAT (auto) | No |
-| `/agent:run` | POST | Native Cortex agent:run | `agent:run` | Session (auto-exchange or passthrough) | Yes |
-| `/v1/messages/agent` | POST | Anthropic Messages API | `agent:run` (translated) | Session (auto-exchange) | Yes |
-| `/v1/chat/completions/agent` | POST | OpenAI Chat API | `agent:run` (translated) | Session (auto-exchange) | Yes |
-| `/*` (wildcard) | ANY | OpenAI Chat API | `chat/completions` | PAT (auto) | No |
+| `/v1/messages` | POST | Anthropic Messages API | `chat/completions` | PAT (auto) | Yes* |
+| `/v1/chat/completions` | POST | OpenAI Chat API | `chat/completions` | PAT (auto) | Yes* |
+| `/agent:run` | POST | Native Cortex agent:run | `agent:run` | Session (auto-exchange or passthrough) | Yes* |
+| `/v1/messages/agent` | POST | Anthropic Messages API | `agent:run` (translated) | Session (auto-exchange) | Yes* |
+| `/v1/chat/completions/agent` | POST | OpenAI Chat API | `agent:run` (translated) | Session (auto-exchange) | Yes* |
+| `/*` (wildcard) | ANY | OpenAI Chat API | `chat/completions` | PAT (auto) | Yes* |
+
+> **\*Policy column**: Policy enforcement applies to all routes when the `[policy]` section is present and `enabled = true`. Omit the `[policy]` section entirely to disable — no performance overhead when disabled.
 
 > **`force_agent_backend = true`**: When this flag is set in `[agent]`, the `/v1/messages` and `/v1/chat/completions` routes automatically delegate to the agent:run translation handlers. All requests get policy enforcement and agent:run features with zero client-side changes.
 
@@ -163,22 +165,33 @@ account_name = "YOUR_ACCOUNT_LOCATOR"
 - `login_name`: Your Snowflake login username (often an email address)
 - `account_name`: Same as the account locator in the URL (e.g., `ORGNAME-ACCOUNTNAME`)
 
-#### Enable Policy Enforcement (Optional)
+#### Policy Enforcement (Optional)
+
+Policy enforcement is **entirely optional**. Without the `[policy]` section, the proxy runs as a pure API translator with zero policy overhead.
+
+To enable, add to your config:
+
+```toml
+[policy]
+enabled = true
+judge_model = "claude-4-sonnet"
+action = "block"                   # "block" | "warn" | "log"
+policies_file = "policies.toml"    # or define rules inline
+```
+
+Make sure `policies.toml` exists in the same directory (it ships with the project).
+
+When enabled, every prompt on every route goes through a **two-tier evaluation**:
+1. **Pattern matching** (fast, case-insensitive) — catches obvious violations like "ignore all previous instructions" with near-zero latency
+2. **Judge model** (thorough) — only invoked if pattern matching doesn't catch the prompt; sends the prompt to a Cortex model for deeper analysis
+
+Optionally combine with the agent backend for full agent:run features:
 
 ```toml
 [agent]
 enabled = true
-default_model = "auto"
-origin_application = "coding_agent"
-force_agent_backend = true   # route ALL traffic through agent:run + policy
-
-[policy]
-enabled = true
-judge_model = "claude-4-sonnet"
-action = "block"
+force_agent_backend = true   # route ALL traffic through agent:run
 ```
-
-Make sure `policies.toml` exists in the same directory (it ships with the project).
 
 Run the proxy:
 
@@ -320,15 +333,15 @@ Custom mappings can be added in the config:
 
 ---
 
-### Policy Enforcement Engine
+### Policy Enforcement Engine (Optional)
 
-The policy engine intercepts prompts on all `agent:run` paths (`/agent:run`, `/v1/messages/agent`, `/v1/chat/completions/agent`) before forwarding to Snowflake.
+When enabled, the policy engine intercepts prompts on **all routes** (`/v1/messages`, `/v1/chat/completions`, `/agent:run`, `/v1/messages/agent`, `/v1/chat/completions/agent`, and wildcard) before forwarding to Snowflake. **Omit the `[policy]` section to disable entirely — no performance cost when disabled.**
 
 #### How It Works
 
 1. Extract the user's prompt text from the request body
-2. Build a policy evaluation prompt containing all active rules, their descriptions, and example violations
-3. Send to Snowflake Cortex `chat/completions` API with the configured judge model
+2. **Tier 1 — Pattern matching**: Check the prompt against known violation patterns from rule examples (case-insensitive). If matched, act immediately with no LLM call
+3. **Tier 2 — Judge model**: If pattern matching passes, build a policy evaluation prompt containing all active rules, their descriptions, and example violations. Send to Snowflake Cortex `chat/completions` API with the configured judge model
 4. Parse the judge model's response: `ALLOW` or `DENY:<rule_name>:<reason>`
 5. If `DENY` and action is `block`: return HTTP 403 to the client
 6. If `DENY` and action is `warn`: log the violation, forward the request
@@ -480,6 +493,25 @@ opencode
 ```
 
 ![OpenCode via Cortex Proxy](Opencode_cortex_proxy.png)
+
+#### ZeroClaw
+
+ZeroClaw is a lightweight Rust-based coding agent. Configure it in `~/.zeroclaw/config.toml`:
+
+```toml
+default_provider = "custom:http://localhost:8766/v1"
+default_model = "claude-4-sonnet"
+api_key = "dummy-key"
+
+[agent]
+max_tool_iterations = 10
+
+[autonomy]
+level = "supervised"
+allowed_commands = ["ls", "cat", "echo", "pwd", "git", "grep", "find", "wc"]
+```
+
+ZeroClaw sends OpenAI-format requests to `/v1/chat/completions` — the proxy translates and forwards to Snowflake Cortex.
 
 #### Continue.dev
 
@@ -708,4 +740,5 @@ Make sure pixi is installed: `curl -fsSL https://pixi.sh/install.sh | bash`. The
 - [OpenCode](https://opencode.ai)
 - [Continue.dev](https://continue.dev)
 - [Mistral Vibe](https://mistral.ai)
+- [ZeroClaw](https://github.com/sfc-gh-kkeller/zeroclaw)
 - [Snowflake Cortex AI](https://docs.snowflake.com/en/user-guide/snowflake-cortex)

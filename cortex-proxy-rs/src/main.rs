@@ -17,7 +17,7 @@ use futures::StreamExt;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::{env, fs, path::PathBuf, sync::Arc, time::Instant};
+use std::{env, fs, net::ToSocketAddrs, path::PathBuf, sync::Arc, time::Instant};
 use tower_http::cors::{Any, CorsLayer};
 
 #[derive(Deserialize)]
@@ -26,6 +26,8 @@ struct Config {
     snowflake: SnowflakeConfig,
     #[serde(default)]
     model_map: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    policy: Option<PolicyConfig>,
 }
 
 #[derive(Deserialize)]
@@ -54,14 +56,62 @@ fn default_model() -> String { "claude-4-sonnet".to_string() }
 fn default_timeout() -> u64 { 300 }
 fn default_pool_size() -> usize { 10 }
 
+#[derive(Deserialize, Clone, Debug)]
+struct PolicyConfig {
+    #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(default = "default_judge_model")]
+    judge_model: String,
+    #[serde(default = "default_action")]
+    action: String,
+    #[serde(default = "default_max_eval_tokens")]
+    max_evaluation_tokens: u64,
+    #[serde(default = "default_policy_source")]
+    source: String,
+    #[serde(default)]
+    policies_file: Option<String>,
+    #[serde(default)]
+    rules: std::collections::HashMap<String, PolicyRule>,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+struct PolicyRule {
+    #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(default = "default_severity")]
+    severity: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    examples: Vec<String>,
+}
+
+fn default_true() -> bool { true }
+fn default_judge_model() -> String { "claude-4-sonnet".to_string() }
+fn default_action() -> String { "block".to_string() }
+fn default_max_eval_tokens() -> u64 { 1024 }
+fn default_policy_source() -> String { "local".to_string() }
+fn default_severity() -> String { "medium".to_string() }
+
+#[derive(Clone, Debug)]
+struct PolicyState {
+    enabled: bool,
+    judge_model: String,
+    action: String,
+    max_evaluation_tokens: u64,
+    rules: Vec<(String, PolicyRule)>,
+}
+
 #[derive(Clone)]
 struct AppState {
     client: Client,
     base_url: String,
+    upstream_host: Option<String>,
     auth_header: String,
     default_model: String,
     log_level: LogLevel,
     model_map: std::collections::HashMap<String, String>,
+    policy: Option<PolicyState>,
 }
 
 #[derive(Clone, Copy, PartialEq, PartialOrd)]
@@ -75,6 +125,13 @@ impl AppState {
     fn log(&self, level: LogLevel, msg: &str) {
         if level >= self.log_level {
             println!("{}", msg);
+        }
+    }
+    fn apply_host_header(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if let Some(ref h) = self.upstream_host {
+            builder.header("Host", h.as_str())
+        } else {
+            builder
         }
     }
 }
@@ -111,6 +168,71 @@ fn load_config() -> Result<Config, String> {
     Ok(config)
 }
 
+fn load_policy(config: &Config) -> Option<PolicyState> {
+    let policy_cfg = config.policy.as_ref()?;
+    if !policy_cfg.enabled {
+        println!("🛡️  Policy: disabled");
+        return None;
+    }
+
+    let mut rules: Vec<(String, PolicyRule)> = vec![];
+
+    if policy_cfg.source == "local" {
+        if let Some(ref path_str) = policy_cfg.policies_file {
+            match load_policy_rules_from_file(path_str) {
+                Ok(file_rules) => rules = file_rules,
+                Err(e) => eprintln!("⚠️  Failed to load policies file {}: {}", path_str, e),
+            }
+        } else {
+            let default_paths = vec!["policies.toml", "config/policies.toml"];
+            for p in &default_paths {
+                if let Ok(r) = load_policy_rules_from_file(p) {
+                    rules = r;
+                    break;
+                }
+            }
+        }
+    }
+
+    for (name, rule) in &policy_cfg.rules {
+        if !rules.iter().any(|(n, _)| n == name) {
+            rules.push((name.clone(), rule.clone()));
+        }
+    }
+
+    let enabled_count = rules.iter().filter(|(_, r)| r.enabled).count();
+    println!("🛡️  Policy: enabled ({} rules, action={})", enabled_count, policy_cfg.action);
+
+    Some(PolicyState {
+        enabled: true,
+        judge_model: policy_cfg.judge_model.clone(),
+        action: policy_cfg.action.clone(),
+        max_evaluation_tokens: policy_cfg.max_evaluation_tokens,
+        rules,
+    })
+}
+
+fn load_policy_rules_from_file(path: &str) -> Result<Vec<(String, PolicyRule)>, String> {
+    let content = fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let raw: toml::Value = toml::from_str(&content).map_err(|e| e.to_string())?;
+    let mut rules = vec![];
+    if let Some(policy) = raw.get("policy") {
+        if let Some(rules_table) = policy.get("rules").and_then(|r| r.as_table()) {
+            for (name, rule_val) in rules_table {
+                let rule: PolicyRule = toml::from_str(&toml::to_string(rule_val).unwrap_or_default())
+                    .unwrap_or(PolicyRule {
+                        enabled: true,
+                        severity: "medium".to_string(),
+                        description: String::new(),
+                        examples: vec![],
+                    });
+                rules.push((name.clone(), rule));
+            }
+        }
+    }
+    Ok(rules)
+}
+
 #[tokio::main]
 async fn main() {
     let config = load_config().unwrap_or_else(|e| { eprintln!("Error: {}", e); std::process::exit(1); });
@@ -120,23 +242,62 @@ async fn main() {
         _ => LogLevel::Info,
     };
 
-    let client = Client::builder()
+    let base_url_str = config.snowflake.base_url.trim_end_matches('/');
+    let is_https = base_url_str.starts_with("https://");
+    let without_scheme = base_url_str.trim_start_matches("https://").trim_start_matches("http://");
+    let host = without_scheme.split('/').next().unwrap_or("localhost");
+    let host_no_port = host.split(':').next().unwrap_or(host);
+    let port: u16 = host.split(':').nth(1).and_then(|p| p.parse().ok()).unwrap_or(if is_https { 443 } else { 80 });
+
+    let resolved_base_url;
+    let client_builder = Client::builder()
         .pool_max_idle_per_host(config.proxy.connection_pool_size)
         .pool_idle_timeout(std::time::Duration::from_secs(60))
         .timeout(std::time::Duration::from_secs(config.proxy.timeout_secs))
         .tcp_keepalive(std::time::Duration::from_secs(30))
-        .tcp_nodelay(true)  // Disable Nagle's algorithm for lower latency
-        .gzip(true)         // Enable gzip compression
-        .build()
-        .unwrap();
+        .tcp_nodelay(true)
+        .gzip(true);
+
+    if host_no_port.contains('_') {
+        if let Ok(mut addrs) = format!("{}:{}", host_no_port, port).to_socket_addrs() {
+            if let Some(addr) = addrs.next() {
+                eprintln!("📡 Hostname has underscores (IDNA-incompatible), resolved {} -> {}", host_no_port, addr.ip());
+                let ip_host = if addr.ip().is_ipv6() {
+                    format!("[{}]", addr.ip())
+                } else {
+                    addr.ip().to_string()
+                };
+                resolved_base_url = base_url_str.replace(host_no_port, &ip_host);
+            } else {
+                resolved_base_url = base_url_str.to_string();
+            }
+        } else {
+            eprintln!("⚠️  Failed to resolve {}, using as-is", host_no_port);
+            resolved_base_url = base_url_str.to_string();
+        }
+    } else {
+        resolved_base_url = base_url_str.to_string();
+    }
+
+    let client = client_builder.build().unwrap();
+
+    let policy = load_policy(&config);
+
+    let upstream_host = if resolved_base_url != base_url_str {
+        Some(host_no_port.to_string())
+    } else {
+        None
+    };
 
     let state = Arc::new(AppState {
         client,
-        base_url: config.snowflake.base_url.trim_end_matches('/').to_string(),
+        base_url: resolved_base_url,
+        upstream_host,
         auth_header: format!("Bearer {}", config.snowflake.pat),
         default_model: config.snowflake.default_model,
         log_level,
         model_map: config.model_map,
+        policy,
     });
 
     let cors = CorsLayer::new()
@@ -551,13 +712,175 @@ fn openai_to_anthropic(openai_resp: &Value, model: &str, req_id: u128) -> Value 
     })
 }
 
+// ============ Policy Evaluation ============
+
+fn extract_user_prompt(messages: &[Value]) -> String {
+    let mut parts = vec![];
+    for msg in messages.iter().rev() {
+        let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+        if role == "user" || role == "system" {
+            if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
+                parts.push(content.to_string());
+            }
+        }
+        if parts.len() >= 3 { break; }
+    }
+    parts.reverse();
+    parts.join("\n")
+}
+
+fn check_policy_patterns(prompt: &str, policy: &PolicyState) -> Option<(String, String, String)> {
+    let prompt_lower = prompt.to_lowercase();
+    for (name, rule) in &policy.rules {
+        if !rule.enabled { continue; }
+        for example in &rule.examples {
+            if prompt_lower.contains(&example.to_lowercase()) {
+                return Some((
+                    name.clone(),
+                    format!("Prompt matches known pattern: {}", example),
+                    rule.severity.clone(),
+                ));
+            }
+        }
+    }
+    None
+}
+
+async fn evaluate_policy_with_judge(
+    state: &AppState,
+    prompt: &str,
+    policy: &PolicyState,
+) -> Option<(String, String, String)> {
+    let mut rules_text = String::new();
+    for (name, rule) in &policy.rules {
+        if !rule.enabled { continue; }
+        rules_text.push_str(&format!("- {}: {} (severity: {})\n", name, rule.description, rule.severity));
+    }
+
+    let judge_prompt = format!(
+        "You are a security policy evaluator. Analyze the following user prompt against these security rules:\n\n\
+         RULES:\n{}\n\n\
+         USER PROMPT:\n{}\n\n\
+         Respond with EXACTLY one line in this format:\n\
+         ALLOWED - if the prompt does not violate any rules\n\
+         BLOCKED|<rule_name>|<severity>|<reason> - if the prompt violates a rule\n\n\
+         Be precise. Only block clearly malicious or policy-violating content.",
+        rules_text,
+        &prompt[..prompt.len().min(2000)]
+    );
+
+    let judge_req = json!({
+        "model": policy.judge_model,
+        "messages": [{"role": "user", "content": judge_prompt}],
+        "max_completion_tokens": policy.max_evaluation_tokens,
+        "stream": false
+    });
+
+    let url = format!("{}/chat/completions", state.base_url);
+    let mut builder = state.client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("Authorization", &state.auth_header)
+        .header("X-Snowflake-Authorization-Token-Type", "PROGRAMMATIC_ACCESS_TOKEN")
+        .json(&judge_req);
+    builder = state.apply_host_header(builder);
+    let resp = builder.send()
+        .await
+        .ok()?;
+
+    if !resp.status().is_success() { return None; }
+
+    let body: Value = resp.json().await.ok()?;
+    let text = body["choices"][0]["message"]["content"].as_str()?;
+    let trimmed = text.trim();
+
+    if trimmed.starts_with("BLOCKED") {
+        let parts: Vec<&str> = trimmed.splitn(4, '|').collect();
+        let rule = parts.get(1).unwrap_or(&"unknown").trim().to_string();
+        let severity = parts.get(2).unwrap_or(&"medium").trim().to_string();
+        let reason = parts.get(3).unwrap_or(&"Policy violation").trim().to_string();
+        Some((rule, reason, severity))
+    } else {
+        None
+    }
+}
+
+async fn evaluate_policy(
+    state: &AppState,
+    messages: &[Value],
+) -> Result<(), (String, String, String)> {
+    let policy = match &state.policy {
+        Some(p) if p.enabled => p,
+        _ => return Ok(()),
+    };
+
+    let prompt = extract_user_prompt(messages);
+    if prompt.is_empty() { return Ok(()); }
+
+    if let Some(violation) = check_policy_patterns(&prompt, policy) {
+        state.log(LogLevel::Info, &format!("🛡️  Policy BLOCKED (pattern): rule={} severity={}", violation.0, violation.2));
+        return Err(violation);
+    }
+
+    if policy.action != "log" {
+        if let Some(violation) = evaluate_policy_with_judge(state, &prompt, policy).await {
+            state.log(LogLevel::Info, &format!("🛡️  Policy BLOCKED (judge): rule={} severity={}", violation.0, violation.2));
+            return Err(violation);
+        }
+    }
+
+    Ok(())
+}
+
+fn policy_block_anthropic(rule: &str, reason: &str, severity: &str, is_streaming: bool, model: &str) -> Response {
+    let msg = format!("Request blocked by policy. Rule: {} (severity: {}). {}", rule, severity, reason);
+    if is_streaming {
+        let body = format!(
+            "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_policy\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"{}\",\"stop_reason\":null}}}}\n\n\
+             event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\n\
+             event: content_block_delta\ndata: {}\n\n\
+             event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n\
+             event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}}}}\n\n\
+             event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n",
+            model,
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": msg}})
+        );
+        (StatusCode::OK, [(header::CONTENT_TYPE, "text/event-stream")], body).into_response()
+    } else {
+        (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")],
+         json!({"id":"msg_policy","type":"message","role":"assistant","content":[{"type":"text","text": msg}],"model":model,"stop_reason":"end_turn","usage":{"input_tokens":0,"output_tokens":0}}).to_string()
+        ).into_response()
+    }
+}
+
+fn policy_block_openai(rule: &str, reason: &str, severity: &str, is_streaming: bool) -> Response {
+    let msg = format!("Request blocked by policy. Rule: {} (severity: {}). {}", rule, severity, reason);
+    if is_streaming {
+        let body = format!(
+            "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            json!({"choices":[{"delta":{"content": msg},"finish_reason":null}]}),
+            json!({"choices":[{"delta":{},"finish_reason":"stop"}]})
+        );
+        (StatusCode::OK, [(header::CONTENT_TYPE, "text/event-stream")], body).into_response()
+    } else {
+        (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")],
+         json!({"choices":[{"message":{"role":"assistant","content": msg},"finish_reason":"stop"}]}).to_string()
+        ).into_response()
+    }
+}
+
 // ============ Health Check Handler ============
 
 async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let policy_status = match &state.policy {
+        Some(p) if p.enabled => json!({"enabled": true, "action": p.action, "rules": p.rules.len(), "judge_model": p.judge_model}),
+        _ => json!({"enabled": false}),
+    };
     axum::Json(json!({
         "status": "ok",
         "service": "cortex-proxy",
         "default_model": state.default_model,
+        "policy": policy_status,
     }))
 }
 
@@ -585,11 +908,17 @@ async fn anthropic_handler(
     let model = openai_req.get("model").and_then(|m| m.as_str()).unwrap_or("claude-4-sonnet");
     state.log(LogLevel::Debug, &format!("[{:06}] OpenAI req: {}", req_id, openai_req));
     
+    if let Some(msgs) = openai_req.get("messages").and_then(|m| m.as_array()) {
+        if let Err((rule, reason, severity)) = evaluate_policy(&state, msgs).await {
+            return policy_block_anthropic(&rule, &reason, &severity, is_streaming, model);
+        }
+    }
+    
     // Forward to Snowflake
     let url = format!("{}/chat/completions", state.base_url);
     let accept = if is_streaming { "text/event-stream" } else { "application/json" };
     
-    let resp = match state.client
+    let resp = match state.apply_host_header(state.client
         .post(&url)
         .header("Content-Type", "application/json")
         .header("Accept", accept)
@@ -597,7 +926,7 @@ async fn anthropic_handler(
         .header("User-Agent", "cortex-proxy/1.0")
         .header("Authorization", &state.auth_header)
         .header("X-Snowflake-Authorization-Token-Type", "PROGRAMMATIC_ACCESS_TOKEN")
-        .json(&openai_req)
+        .json(&openai_req))
         .send()
         .await
     {
@@ -875,6 +1204,17 @@ async fn openai_handler(State(state): State<Arc<AppState>>, req: Request<Body>) 
     };
     
     let (transformed, is_streaming) = transform_openai(&body, &state.model_map);
+    
+    if state.policy.is_some() {
+        if let Ok(data) = serde_json::from_slice::<Value>(&body) {
+            if let Some(msgs) = data.get("messages").and_then(|m| m.as_array()) {
+                if let Err((rule, reason, severity)) = evaluate_policy(&state, msgs).await {
+                    return policy_block_openai(&rule, &reason, &severity, is_streaming);
+                }
+            }
+        }
+    }
+    
     let normalized_path = if path.starts_with("/v1/") { &path[3..] } else { &path };
     let normalized_path = if normalized_path.starts_with("chat/") {
         format!("/{}", normalized_path)
@@ -886,19 +1226,24 @@ async fn openai_handler(State(state): State<Arc<AppState>>, req: Request<Body>) 
     let url = format!("{}{}", state.base_url, normalized_path);
     let accept = if is_streaming { "text/event-stream" } else { "application/json" };
     
-    let resp = match state.client.request(method, &url)
+    let mut req_builder = state.apply_host_header(state.client.request(method.clone(), &url)
         .header("Content-Type", "application/json")
         .header("Accept", accept)
         .header("Accept-Encoding", "gzip")
         .header("User-Agent", "cortex-proxy/1.0")
         .header("Authorization", &state.auth_header)
-        .header("X-Snowflake-Authorization-Token-Type", "PROGRAMMATIC_ACCESS_TOKEN")
-        .body(transformed)
-        .send()
-        .await
+        .header("X-Snowflake-Authorization-Token-Type", "PROGRAMMATIC_ACCESS_TOKEN"));
+    
+    if method != Method::GET && method != Method::HEAD && !transformed.is_empty() {
+        req_builder = req_builder.body(transformed);
+    }
+    
+    let resp = match req_builder.send().await
     {
         Ok(r) => r,
-        Err(e) => return error_response(502, &e.to_string()),
+        Err(e) => {
+            return error_response(502, &format!("upstream error: {}", e));
+        },
     };
     
     let status = resp.status();
