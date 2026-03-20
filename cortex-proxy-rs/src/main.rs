@@ -23,7 +23,10 @@ use tower_http::cors::{Any, CorsLayer};
 #[derive(Deserialize)]
 struct Config {
     proxy: ProxyConfig,
-    snowflake: SnowflakeConfig,
+    #[serde(default)]
+    snowflake: Option<SnowflakeConfig>,
+    #[serde(default)]
+    backend: Option<BackendConfig>,
     #[serde(default)]
     model_map: std::collections::HashMap<String, String>,
     #[serde(default)]
@@ -55,6 +58,38 @@ fn default_log_level() -> String { "info".to_string() }
 fn default_model() -> String { "claude-4-sonnet".to_string() }
 fn default_timeout() -> u64 { 300 }
 fn default_pool_size() -> usize { 10 }
+
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum BackendType {
+    Cortex,
+    Openai,
+    Anthropic,
+    Ollama,
+}
+
+#[derive(Deserialize)]
+struct BackendConfig {
+    #[serde(rename = "type", default = "default_backend_type")]
+    backend_type: BackendType,
+    #[serde(default)]
+    base_url: Option<String>,
+    #[serde(default)]
+    api_key: Option<String>,
+    #[serde(default = "default_anthropic_version")]
+    anthropic_version: String,
+    #[serde(default)]
+    default_model: Option<String>,
+    #[serde(default)]
+    extra_headers: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    snowflake: bool,
+    #[serde(default)]
+    use_max_completion_tokens: bool,
+}
+
+fn default_backend_type() -> BackendType { BackendType::Cortex }
+fn default_anthropic_version() -> String { "2023-06-01".to_string() }
 
 #[derive(Deserialize, Clone, Debug)]
 struct PolicyConfig {
@@ -105,12 +140,18 @@ struct PolicyState {
 #[derive(Clone)]
 struct AppState {
     client: Client,
+    backend_type: BackendType,
     base_url: String,
     upstream_host: Option<String>,
     auth_header: String,
+    backend_api_key: Option<String>,
+    anthropic_version: String,
     default_model: String,
     log_level: LogLevel,
     model_map: std::collections::HashMap<String, String>,
+    extra_headers: std::collections::HashMap<String, String>,
+    snowflake_compat: bool,
+    use_max_completion_tokens: bool,
     policy: Option<PolicyState>,
 }
 
@@ -132,6 +173,50 @@ impl AppState {
             builder.header("Host", h.as_str())
         } else {
             builder
+        }
+    }
+    fn apply_backend_auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let b = match self.backend_type {
+            BackendType::Cortex => {
+                builder
+                    .header("Authorization", &self.auth_header)
+                    .header("X-Snowflake-Authorization-Token-Type", "PROGRAMMATIC_ACCESS_TOKEN")
+            }
+            BackendType::Openai | BackendType::Ollama => {
+                let mut b = if !self.auth_header.is_empty() {
+                    builder.header("Authorization", &self.auth_header)
+                } else {
+                    builder
+                };
+                if self.snowflake_compat {
+                    b = b.header("X-Snowflake-Authorization-Token-Type", "PROGRAMMATIC_ACCESS_TOKEN");
+                }
+                b
+            }
+            BackendType::Anthropic => {
+                let mut b = builder.header("anthropic-version", self.anthropic_version.as_str());
+                if let Some(ref key) = self.backend_api_key {
+                    b = b.header("x-api-key", key.as_str());
+                }
+                if self.snowflake_compat {
+                    if let Some(ref key) = self.backend_api_key {
+                        b = b.header("Authorization", format!("Bearer {}", key));
+                    }
+                    b = b.header("X-Snowflake-Authorization-Token-Type", "PROGRAMMATIC_ACCESS_TOKEN");
+                }
+                b
+            }
+        };
+        let mut b = self.apply_host_header(b);
+        for (k, v) in &self.extra_headers {
+            b = b.header(k.as_str(), v.as_str());
+        }
+        b
+    }
+    fn backend_url(&self, path: &str) -> String {
+        match self.backend_type {
+            BackendType::Anthropic => format!("{}/v1/messages", self.base_url),
+            _ => format!("{}{}", self.base_url, path),
         }
     }
 }
@@ -242,7 +327,40 @@ async fn main() {
         _ => LogLevel::Info,
     };
 
-    let base_url_str = config.snowflake.base_url.trim_end_matches('/');
+    let backend_cfg = config.backend.as_ref();
+    let backend_type = backend_cfg.map(|b| b.backend_type.clone()).unwrap_or(BackendType::Cortex);
+
+    let (raw_base_url, auth_header_val, api_key, anthro_ver, default_model) = match backend_type {
+        BackendType::Cortex => {
+            let sf = config.snowflake.as_ref().unwrap_or_else(|| {
+                eprintln!("Error: [snowflake] section required for cortex backend");
+                std::process::exit(1);
+            });
+            (sf.base_url.clone(), format!("Bearer {}", sf.pat), None, String::new(), sf.default_model.clone())
+        }
+        BackendType::Openai => {
+            let base = backend_cfg.and_then(|b| b.base_url.clone()).unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+            let key = backend_cfg.and_then(|b| b.api_key.clone()).unwrap_or_default();
+            let model = backend_cfg.and_then(|b| b.default_model.clone()).unwrap_or_else(|| "gpt-4o".to_string());
+            (base, format!("Bearer {}", key), None, String::new(), model)
+        }
+        BackendType::Anthropic => {
+            let base = backend_cfg.and_then(|b| b.base_url.clone()).unwrap_or_else(|| "https://api.anthropic.com".to_string());
+            let key = backend_cfg.and_then(|b| b.api_key.clone());
+            let model = backend_cfg.and_then(|b| b.default_model.clone()).unwrap_or_else(|| "claude-sonnet-4-20250514".to_string());
+            let ver = backend_cfg.map(|b| b.anthropic_version.clone()).unwrap_or_else(default_anthropic_version);
+            (base, String::new(), key, ver, model)
+        }
+        BackendType::Ollama => {
+            let base = backend_cfg.and_then(|b| b.base_url.clone()).unwrap_or_else(|| "http://localhost:11434/v1".to_string());
+            let key = backend_cfg.and_then(|b| b.api_key.clone()).unwrap_or_default();
+            let model = backend_cfg.and_then(|b| b.default_model.clone()).unwrap_or_else(|| "llama3.1".to_string());
+            let auth = if key.is_empty() { String::new() } else { format!("Bearer {}", key) };
+            (base, auth, None, String::new(), model)
+        }
+    };
+
+    let base_url_str = raw_base_url.trim_end_matches('/');
     let is_https = base_url_str.starts_with("https://");
     let without_scheme = base_url_str.trim_start_matches("https://").trim_start_matches("http://");
     let host = without_scheme.split('/').next().unwrap_or("localhost");
@@ -291,12 +409,18 @@ async fn main() {
 
     let state = Arc::new(AppState {
         client,
+        backend_type: backend_type.clone(),
         base_url: resolved_base_url,
         upstream_host,
-        auth_header: format!("Bearer {}", config.snowflake.pat),
-        default_model: config.snowflake.default_model,
+        auth_header: auth_header_val,
+        backend_api_key: api_key,
+        anthropic_version: anthro_ver,
+        default_model,
         log_level,
         model_map: config.model_map,
+        extra_headers: backend_cfg.map(|b| b.extra_headers.clone()).unwrap_or_default(),
+        snowflake_compat: backend_cfg.map(|b| b.snowflake).unwrap_or(false),
+        use_max_completion_tokens: backend_cfg.map(|b| b.use_max_completion_tokens || b.snowflake).unwrap_or(false),
         policy,
     });
 
@@ -313,8 +437,16 @@ async fn main() {
         .layer(cors)
         .with_state(state.clone());
 
+    let backend_label = match backend_type {
+        BackendType::Cortex => "Snowflake Cortex",
+        BackendType::Openai => "OpenAI",
+        BackendType::Anthropic => "Anthropic",
+        BackendType::Ollama => "Ollama",
+    };
     let port = config.proxy.port;
-    println!("🚀 Cortex Proxy on http://localhost:{}", port);
+    let sf_flag = if state.snowflake_compat { " [snowflake]" } else { "" };
+    let mct_flag = if state.use_max_completion_tokens && !state.snowflake_compat { " [max_completion_tokens]" } else { "" };
+    println!("🚀 Cortex Proxy on http://localhost:{} → {}{}{}", port, backend_label, sf_flag, mct_flag);
     println!("   /v1/messages (Anthropic) | /chat/completions (OpenAI)");
     println!();
 
@@ -324,21 +456,26 @@ async fn main() {
 
 // ============ Model Mapping ============
 
-fn map_model(model: &str, model_map: &std::collections::HashMap<String, String>) -> String {
+fn map_model(model: &str, model_map: &std::collections::HashMap<String, String>, backend_type: &BackendType) -> String {
     if let Some(mapped) = model_map.get(model) {
         return mapped.clone();
     }
-    let m = model.to_lowercase();
-    if m.contains("opus-4-5") || m.contains("4-5-opus") {
-        "claude-opus-4-5".to_string()
-    } else if m.contains("4-opus") || m.contains("opus-4") {
-        "claude-4-opus".to_string()
-    } else if m.contains("haiku") {
-        "claude-haiku-4-5".to_string()
-    } else if m.contains("3-5") && m.contains("sonnet") {
-        "claude-3-5-sonnet".to_string()
-    } else {
-        "claude-4-sonnet".to_string()
+    match backend_type {
+        BackendType::Cortex => {
+            let m = model.to_lowercase();
+            if m.contains("opus-4-5") || m.contains("4-5-opus") {
+                "claude-opus-4-5".to_string()
+            } else if m.contains("4-opus") || m.contains("opus-4") {
+                "claude-4-opus".to_string()
+            } else if m.contains("haiku") {
+                "claude-haiku-4-5".to_string()
+            } else if m.contains("3-5") && m.contains("sonnet") {
+                "claude-3-5-sonnet".to_string()
+            } else {
+                "claude-4-sonnet".to_string()
+            }
+        }
+        _ => model.to_string(),
     }
 }
 
@@ -401,11 +538,13 @@ fn anthropic_to_openai(
     body: &[u8],
     default_model: &str,
     model_map: &std::collections::HashMap<String, String>,
+    backend_type: &BackendType,
+    use_max_completion_tokens: bool,
 ) -> Result<(Value, bool), String> {
     let req: Value = serde_json::from_slice(body).map_err(|e| e.to_string())?;
     
     let model = req.get("model").and_then(|m| m.as_str()).unwrap_or(default_model);
-    let snowflake_model = map_model(model, model_map);
+    let snowflake_model = map_model(model, model_map, backend_type);
     let is_streaming = req.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
     let max_tokens = req.get("max_tokens").and_then(|m| m.as_u64()).unwrap_or(4096);
     
@@ -606,9 +745,13 @@ fn anthropic_to_openai(
     let mut openai_req = json!({
         "model": snowflake_model,
         "messages": messages,
-        "stream": is_streaming,
-        "max_completion_tokens": max_tokens
+        "stream": is_streaming
     });
+    match backend_type {
+        BackendType::Cortex => { openai_req["max_completion_tokens"] = json!(max_tokens); }
+        _ if use_max_completion_tokens => { openai_req["max_completion_tokens"] = json!(max_tokens); }
+        _ => { openai_req["max_tokens"] = json!(max_tokens); }
+    }
     
     // Convert tools from Anthropic format to OpenAI format
     if let Some(tools) = req.get("tools").and_then(|t| t.as_array()) {
@@ -658,11 +801,11 @@ fn openai_to_anthropic(openai_resp: &Value, model: &str, req_id: u128) -> Value 
     
     let mut content: Vec<Value> = vec![];
     
-    // Add text content if present
-    if let Some(text) = message.get("content").and_then(|c| c.as_str()) {
-        if !text.is_empty() {
-            content.push(json!({"type": "text", "text": text}));
-        }
+    // Add text content if present (including reasoning from thinking models)
+    let text = message.get("content").and_then(|c| c.as_str()).filter(|s| !s.is_empty())
+        .or_else(|| message.get("reasoning").and_then(|c| c.as_str()).filter(|s| !s.is_empty()));
+    if let Some(text) = text {
+        content.push(json!({"type": "text", "text": text}));
     }
     
     // Convert tool_calls to tool_use blocks
@@ -712,6 +855,200 @@ fn openai_to_anthropic(openai_resp: &Value, model: &str, req_id: u128) -> Value 
     })
 }
 
+// ============ OpenAI -> Anthropic Request Conversion ============
+
+fn openai_to_anthropic_request(
+    body: &[u8],
+    default_model: &str,
+    model_map: &std::collections::HashMap<String, String>,
+    backend_type: &BackendType,
+) -> Result<(Value, bool), String> {
+    let req: Value = serde_json::from_slice(body).map_err(|e| e.to_string())?;
+
+    let model = req.get("model").and_then(|m| m.as_str()).unwrap_or(default_model);
+    let mapped_model = map_model(model, model_map, backend_type);
+    let is_streaming = req.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
+    let max_tokens = req.get("max_tokens")
+        .or_else(|| req.get("max_completion_tokens"))
+        .and_then(|m| m.as_u64())
+        .unwrap_or(4096);
+
+    let mut system_text = String::new();
+    let mut anthropic_msgs: Vec<Value> = vec![];
+
+    if let Some(msgs) = req.get("messages").and_then(|m| m.as_array()) {
+        let mut pending_tool_results: Vec<Value> = vec![];
+
+        for msg in msgs {
+            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+
+            match role {
+                "system" => {
+                    if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
+                        if !system_text.is_empty() { system_text.push('\n'); }
+                        system_text.push_str(content);
+                    }
+                }
+                "assistant" => {
+                    if !pending_tool_results.is_empty() {
+                        anthropic_msgs.push(json!({"role": "user", "content": pending_tool_results.clone()}));
+                        pending_tool_results.clear();
+                    }
+                    let mut content_blocks: Vec<Value> = vec![];
+                    if let Some(text) = msg.get("content").and_then(|c| c.as_str()) {
+                        if !text.is_empty() {
+                            content_blocks.push(json!({"type": "text", "text": text}));
+                        }
+                    }
+                    if let Some(tool_calls) = msg.get("tool_calls").and_then(|t| t.as_array()) {
+                        for tc in tool_calls {
+                            let id = tc.get("id").and_then(|i| i.as_str()).unwrap_or("");
+                            let func = &tc["function"];
+                            let name = func.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                            let args_str = func.get("arguments").and_then(|a| a.as_str()).unwrap_or("{}");
+                            let input: Value = serde_json::from_str(args_str).unwrap_or(json!({}));
+                            content_blocks.push(json!({
+                                "type": "tool_use",
+                                "id": id,
+                                "name": name,
+                                "input": input
+                            }));
+                        }
+                    }
+                    if content_blocks.is_empty() {
+                        content_blocks.push(json!({"type": "text", "text": ""}));
+                    }
+                    anthropic_msgs.push(json!({"role": "assistant", "content": content_blocks}));
+                }
+                "tool" => {
+                    let tool_use_id = msg.get("tool_call_id").and_then(|i| i.as_str()).unwrap_or("");
+                    let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                    pending_tool_results.push(json!({
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": content
+                    }));
+                }
+                _ => {
+                    if !pending_tool_results.is_empty() {
+                        anthropic_msgs.push(json!({"role": "user", "content": pending_tool_results.clone()}));
+                        pending_tool_results.clear();
+                    }
+                    let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                    anthropic_msgs.push(json!({"role": "user", "content": content}));
+                }
+            }
+        }
+
+        if !pending_tool_results.is_empty() {
+            anthropic_msgs.push(json!({"role": "user", "content": pending_tool_results}));
+        }
+    }
+
+    let mut anthropic_req = json!({
+        "model": mapped_model,
+        "messages": anthropic_msgs,
+        "max_tokens": max_tokens,
+        "stream": is_streaming
+    });
+
+    if !system_text.is_empty() {
+        anthropic_req["system"] = json!(system_text);
+    }
+
+    if let Some(tools) = req.get("tools").and_then(|t| t.as_array()) {
+        let anthropic_tools: Vec<Value> = tools.iter().map(|tool| {
+            let func = tool.get("function").unwrap_or(tool);
+            let name = func.get("name").and_then(|n| n.as_str()).unwrap_or("");
+            let description = func.get("description").and_then(|d| d.as_str()).unwrap_or("");
+            let params = func.get("parameters").cloned().unwrap_or(json!({"type": "object"}));
+            json!({
+                "name": name,
+                "description": description,
+                "input_schema": params
+            })
+        }).collect();
+        if !anthropic_tools.is_empty() {
+            anthropic_req["tools"] = json!(anthropic_tools);
+        }
+    }
+
+    if let Some(temp) = req.get("temperature") { anthropic_req["temperature"] = temp.clone(); }
+    if let Some(top_p) = req.get("top_p") { anthropic_req["top_p"] = top_p.clone(); }
+    if let Some(stop) = req.get("stop") { anthropic_req["stop_sequences"] = stop.clone(); }
+
+    Ok((anthropic_req, is_streaming))
+}
+
+// ============ Anthropic Native Response -> OpenAI Conversion ============
+
+fn anthropic_response_to_openai(resp: &Value) -> Value {
+    let mut content_text = String::new();
+    let mut tool_calls: Vec<Value> = vec![];
+
+    if let Some(content) = resp.get("content").and_then(|c| c.as_array()) {
+        for block in content {
+            match block.get("type").and_then(|t| t.as_str()) {
+                Some("text") => {
+                    if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                        content_text.push_str(text);
+                    }
+                }
+                Some("tool_use") => {
+                    let id = block.get("id").and_then(|i| i.as_str()).unwrap_or("");
+                    let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                    let input = block.get("input").cloned().unwrap_or(json!({}));
+                    tool_calls.push(json!({
+                        "id": id,
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": serde_json::to_string(&input).unwrap_or_default()
+                        }
+                    }));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let stop_reason = resp.get("stop_reason").and_then(|r| r.as_str()).unwrap_or("end_turn");
+    let finish_reason = match stop_reason {
+        "end_turn" => "stop",
+        "tool_use" => "tool_calls",
+        "max_tokens" => "length",
+        _ => "stop",
+    };
+
+    let usage = resp.get("usage").cloned().unwrap_or(json!({}));
+    let prompt_tokens = usage.get("input_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+    let completion_tokens = usage.get("output_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+
+    let mut message = json!({
+        "role": "assistant",
+        "content": if content_text.is_empty() { Value::Null } else { json!(content_text) }
+    });
+    if !tool_calls.is_empty() {
+        message["tool_calls"] = json!(tool_calls);
+    }
+
+    json!({
+        "id": resp.get("id").and_then(|i| i.as_str()).unwrap_or("chatcmpl-proxy"),
+        "object": "chat.completion",
+        "model": resp.get("model").and_then(|m| m.as_str()).unwrap_or(""),
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": finish_reason
+        }],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens
+        }
+    })
+}
+
 // ============ Policy Evaluation ============
 
 fn extract_user_prompt(messages: &[Value]) -> String {
@@ -719,8 +1056,16 @@ fn extract_user_prompt(messages: &[Value]) -> String {
     for msg in messages.iter().rev() {
         let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
         if role == "user" || role == "system" {
-            if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
-                parts.push(content.to_string());
+            match msg.get("content") {
+                Some(Value::String(s)) => parts.push(s.clone()),
+                Some(Value::Array(blocks)) => {
+                    for block in blocks {
+                        if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                            parts.push(text.to_string());
+                        }
+                    }
+                }
+                _ => {}
             }
         }
         if parts.len() >= 3 { break; }
@@ -769,21 +1114,35 @@ async fn evaluate_policy_with_judge(
         &prompt[..prompt.len().min(2000)]
     );
 
-    let judge_req = json!({
-        "model": policy.judge_model,
-        "messages": [{"role": "user", "content": judge_prompt}],
-        "max_completion_tokens": policy.max_evaluation_tokens,
-        "stream": false
-    });
+    let judge_req = match state.backend_type {
+        BackendType::Anthropic => json!({
+            "model": policy.judge_model,
+            "messages": [{"role": "user", "content": judge_prompt}],
+            "max_tokens": policy.max_evaluation_tokens,
+            "stream": false
+        }),
+        _ if state.use_max_completion_tokens || state.backend_type == BackendType::Cortex => json!({
+            "model": policy.judge_model,
+            "messages": [{"role": "user", "content": judge_prompt}],
+            "max_completion_tokens": policy.max_evaluation_tokens,
+            "stream": false
+        }),
+        _ => json!({
+            "model": policy.judge_model,
+            "messages": [{"role": "user", "content": judge_prompt}],
+            "max_tokens": policy.max_evaluation_tokens,
+            "stream": false
+        }),
+    };
 
-    let url = format!("{}/chat/completions", state.base_url);
-    let mut builder = state.client
+    let url = match state.backend_type {
+        BackendType::Anthropic => format!("{}/v1/messages", state.base_url),
+        _ => format!("{}/chat/completions", state.base_url),
+    };
+    let builder = state.apply_backend_auth(state.client
         .post(&url)
         .header("Content-Type", "application/json")
-        .header("Authorization", &state.auth_header)
-        .header("X-Snowflake-Authorization-Token-Type", "PROGRAMMATIC_ACCESS_TOKEN")
-        .json(&judge_req);
-    builder = state.apply_host_header(builder);
+        .json(&judge_req));
     let resp = builder.send()
         .await
         .ok()?;
@@ -791,7 +1150,19 @@ async fn evaluate_policy_with_judge(
     if !resp.status().is_success() { return None; }
 
     let body: Value = resp.json().await.ok()?;
-    let text = body["choices"][0]["message"]["content"].as_str()?;
+    let text = match state.backend_type {
+        BackendType::Anthropic => {
+            body.get("content")
+                .and_then(|c| c.as_array())
+                .and_then(|a| a.first())
+                .and_then(|b| b.get("text"))
+                .and_then(|t| t.as_str())
+                .map(|s| s.to_string())
+        }
+        _ => {
+            body["choices"][0]["message"]["content"].as_str().map(|s| s.to_string())
+        }
+    }?;
     let trimmed = text.trim();
 
     if trimmed.starts_with("BLOCKED") {
@@ -876,9 +1247,16 @@ async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
         Some(p) if p.enabled => json!({"enabled": true, "action": p.action, "rules": p.rules.len(), "judge_model": p.judge_model}),
         _ => json!({"enabled": false}),
     };
+    let backend_label = match state.backend_type {
+        BackendType::Cortex => "cortex",
+        BackendType::Openai => "openai",
+        BackendType::Anthropic => "anthropic",
+        BackendType::Ollama => "ollama",
+    };
     axum::Json(json!({
         "status": "ok",
         "service": "cortex-proxy",
+        "backend": backend_label,
         "default_model": state.default_model,
         "policy": policy_status,
     }))
@@ -893,11 +1271,13 @@ async fn anthropic_handler(
     let start = Instant::now();
     let req_id = (start.elapsed().as_nanos() % 1_000_000) as u128;
     
-    // Log request immediately
     eprintln!("DEBUG [{:06}] Request received, body size: {} bytes", req_id, body.len());
+
+    if state.backend_type == BackendType::Anthropic {
+        return anthropic_passthrough(&state, &body, start, req_id).await;
+    }
     
-    // Convert Anthropic -> OpenAI format
-    let (openai_req, is_streaming) = match anthropic_to_openai(&body, &state.default_model, &state.model_map) {
+    let (openai_req, is_streaming) = match anthropic_to_openai(&body, &state.default_model, &state.model_map, &state.backend_type, state.use_max_completion_tokens) {
         Ok(r) => r,
         Err(e) => {
             state.log(LogLevel::Info, &format!("[{:06}] Parse error: {}", req_id, e));
@@ -914,18 +1294,15 @@ async fn anthropic_handler(
         }
     }
     
-    // Forward to Snowflake
-    let url = format!("{}/chat/completions", state.base_url);
+    let url = state.backend_url("/chat/completions");
     let accept = if is_streaming { "text/event-stream" } else { "application/json" };
     
-    let resp = match state.apply_host_header(state.client
+    let resp = match state.apply_backend_auth(state.client
         .post(&url)
         .header("Content-Type", "application/json")
         .header("Accept", accept)
         .header("Accept-Encoding", "gzip")
         .header("User-Agent", "cortex-proxy/1.0")
-        .header("Authorization", &state.auth_header)
-        .header("X-Snowflake-Authorization-Token-Type", "PROGRAMMATIC_ACCESS_TOKEN")
         .json(&openai_req))
         .send()
         .await
@@ -1009,22 +1386,22 @@ async fn anthropic_handler(
                                 let delta = &chunk_data["choices"][0]["delta"];
                                 let finish = chunk_data["choices"][0].get("finish_reason");
                                 
-                                // Handle text content
-                                if let Some(text) = delta.get("content").and_then(|c| c.as_str()) {
-                                    if !text.is_empty() {
-                                        if !had_text_content {
-                                            yield Ok(Bytes::from(format!(
-                                                "event: content_block_start\ndata: {}\n\n",
-                                                json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}})
-                                            )));
-                                            had_text_content = true;
-                                            last_content_index = 0;
-                                        }
+                                // Handle text content (including reasoning from thinking models)
+                                let text = delta.get("content").and_then(|c| c.as_str()).filter(|s| !s.is_empty())
+                                    .or_else(|| delta.get("reasoning").and_then(|c| c.as_str()).filter(|s| !s.is_empty()));
+                                if let Some(text) = text {
+                                    if !had_text_content {
                                         yield Ok(Bytes::from(format!(
-                                            "event: content_block_delta\ndata: {}\n\n",
-                                            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}})
+                                            "event: content_block_start\ndata: {}\n\n",
+                                            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}})
                                         )));
+                                        had_text_content = true;
+                                        last_content_index = 0;
                                     }
+                                    yield Ok(Bytes::from(format!(
+                                        "event: content_block_delta\ndata: {}\n\n",
+                                        json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}})
+                                    )));
                                 }
                                 
                                 // Handle tool calls
@@ -1161,6 +1538,92 @@ async fn anthropic_handler(
     }
 }
 
+async fn anthropic_passthrough(
+    state: &AppState,
+    body: &Bytes,
+    start: Instant,
+    req_id: u128,
+) -> Response {
+    let parsed: Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(e) => return anthropic_error(400, &e.to_string()),
+    };
+
+    let is_streaming = parsed.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
+    let model = parsed.get("model").and_then(|m| m.as_str()).unwrap_or(&state.default_model);
+
+    let mut check_msgs: Vec<Value> = vec![];
+    if let Some(system) = parsed.get("system") {
+        let sys_text = match system {
+            Value::String(s) => s.clone(),
+            Value::Array(arr) => arr.iter()
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>().join("\n"),
+            _ => String::new(),
+        };
+        if !sys_text.is_empty() {
+            check_msgs.push(json!({"role": "system", "content": sys_text}));
+        }
+    }
+    if let Some(msgs) = parsed.get("messages").and_then(|m| m.as_array()) {
+        check_msgs.extend(msgs.clone());
+    }
+    if let Err((rule, reason, severity)) = evaluate_policy(state, &check_msgs).await {
+        return policy_block_anthropic(&rule, &reason, &severity, is_streaming, model);
+    }
+
+    let mut req_body = parsed.clone();
+    let mapped_model = map_model(model, &state.model_map, &state.backend_type);
+    req_body["model"] = json!(mapped_model);
+
+    let url = format!("{}/v1/messages", state.base_url);
+    let accept = if is_streaming { "text/event-stream" } else { "application/json" };
+
+    let resp = match state.apply_backend_auth(state.client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("Accept", accept)
+        .header("User-Agent", "cortex-proxy/1.0")
+        .json(&req_body))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return anthropic_error(502, &format!("Upstream error: {}", e)),
+    };
+
+    let status = resp.status();
+    if !status.is_success() {
+        let error_body = resp.text().await.unwrap_or_default();
+        state.log(LogLevel::Info, &format!("[{:06}] HTTP {}: {}", req_id, status.as_u16(), &error_body[..error_body.len().min(200)]));
+        return anthropic_error(status.as_u16(), &error_body);
+    }
+
+    if is_streaming {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+        headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+        let state_log = state.log_level;
+        let stream = async_stream::stream! {
+            let mut s = resp.bytes_stream();
+            while let Some(chunk) = s.next().await {
+                match chunk {
+                    Ok(b) => yield Ok::<_, std::io::Error>(b),
+                    Err(_) => break,
+                }
+            }
+            if state_log <= LogLevel::Info {
+                println!("[{:06}] /v1/messages passthrough stream {}ms", req_id, start.elapsed().as_millis());
+            }
+        };
+        (StatusCode::OK, headers, Body::from_stream(stream)).into_response()
+    } else {
+        let resp_body = resp.bytes().await.unwrap_or_default();
+        state.log(LogLevel::Info, &format!("[{:06}] /v1/messages passthrough {}ms", req_id, start.elapsed().as_millis()));
+        (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], resp_body).into_response()
+    }
+}
+
 fn anthropic_error(code: u16, msg: &str) -> Response {
     (
         StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
@@ -1202,18 +1665,23 @@ async fn openai_handler(State(state): State<Arc<AppState>>, req: Request<Body>) 
         Ok(b) => b,
         Err(e) => return error_response(500, &e.to_string()),
     };
-    
-    let (transformed, is_streaming) = transform_openai(&body, &state.model_map);
-    
+
     if state.policy.is_some() {
         if let Ok(data) = serde_json::from_slice::<Value>(&body) {
             if let Some(msgs) = data.get("messages").and_then(|m| m.as_array()) {
+                let is_streaming = data.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
                 if let Err((rule, reason, severity)) = evaluate_policy(&state, msgs).await {
                     return policy_block_openai(&rule, &reason, &severity, is_streaming);
                 }
             }
         }
     }
+
+    if state.backend_type == BackendType::Anthropic {
+        return openai_to_anthropic_backend(&state, &body, &path, start, req_id).await;
+    }
+    
+    let (transformed, is_streaming) = transform_openai(&body, &state.model_map, &state.backend_type, state.use_max_completion_tokens);
     
     let normalized_path = if path.starts_with("/v1/") { &path[3..] } else { &path };
     let normalized_path = if normalized_path.starts_with("chat/") {
@@ -1226,13 +1694,11 @@ async fn openai_handler(State(state): State<Arc<AppState>>, req: Request<Body>) 
     let url = format!("{}{}", state.base_url, normalized_path);
     let accept = if is_streaming { "text/event-stream" } else { "application/json" };
     
-    let mut req_builder = state.apply_host_header(state.client.request(method.clone(), &url)
+    let mut req_builder = state.apply_backend_auth(state.client.request(method.clone(), &url)
         .header("Content-Type", "application/json")
         .header("Accept", accept)
         .header("Accept-Encoding", "gzip")
-        .header("User-Agent", "cortex-proxy/1.0")
-        .header("Authorization", &state.auth_header)
-        .header("X-Snowflake-Authorization-Token-Type", "PROGRAMMATIC_ACCESS_TOKEN"));
+        .header("User-Agent", "cortex-proxy/1.0"));
     
     if method != Method::GET && method != Method::HEAD && !transformed.is_empty() {
         req_builder = req_builder.body(transformed);
@@ -1279,20 +1745,185 @@ async fn openai_handler(State(state): State<Arc<AppState>>, req: Request<Body>) 
     }
 }
 
+async fn openai_to_anthropic_backend(
+    state: &AppState,
+    body: &Bytes,
+    _path: &str,
+    start: Instant,
+    req_id: u128,
+) -> Response {
+    let (anthropic_req, is_streaming) = match openai_to_anthropic_request(body, &state.default_model, &state.model_map, &state.backend_type) {
+        Ok(r) => r,
+        Err(e) => return error_response(400, &e),
+    };
+
+    let url = format!("{}/v1/messages", state.base_url);
+    let accept = if is_streaming { "text/event-stream" } else { "application/json" };
+
+    let resp = match state.apply_backend_auth(state.client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("Accept", accept)
+        .header("User-Agent", "cortex-proxy/1.0")
+        .json(&anthropic_req))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return error_response(502, &format!("upstream error: {}", e)),
+    };
+
+    let status = resp.status();
+    if !status.is_success() {
+        let error_body = resp.text().await.unwrap_or_default();
+        state.log(LogLevel::Info, &format!("[{:06}] HTTP {}", req_id, status.as_u16()));
+        return (StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+            [(header::CONTENT_TYPE, "application/json")], error_body).into_response();
+    }
+
+    if is_streaming {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+        headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+        let log_level = state.log_level;
+        let stream = async_stream::stream! {
+            let mut buffer = String::new();
+            let mut tool_index_counter = 0usize;
+            let mut sent_role = false;
+            let mut byte_stream = resp.bytes_stream();
+            while let Some(chunk) = byte_stream.next().await {
+                match chunk {
+                    Ok(bytes) => {
+                        buffer.push_str(&String::from_utf8_lossy(&bytes));
+                        while let Some(pos) = buffer.find("\n\n") {
+                            let line = buffer[..pos].to_string();
+                            buffer = buffer[pos + 2..].to_string();
+                            let data_line = if line.starts_with("data: ") {
+                                &line[6..]
+                            } else if let Some(idx) = line.find("\ndata: ") {
+                                &line[idx + 7..]
+                            } else {
+                                continue;
+                            };
+                            if let Ok(event) = serde_json::from_str::<Value>(data_line) {
+                                let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                                match event_type {
+                                    "message_start" => {
+                                        if !sent_role {
+                                            yield Ok::<_, std::io::Error>(Bytes::from(format!(
+                                                "data: {}\n\n",
+                                                json!({"choices":[{"delta":{"role":"assistant","content":""},"index":0}]})
+                                            )));
+                                            sent_role = true;
+                                        }
+                                    }
+                                    "content_block_start" => {
+                                        let cb = &event["content_block"];
+                                        if cb.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+                                            let id = cb.get("id").and_then(|i| i.as_str()).unwrap_or("");
+                                            let name = cb.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                                            yield Ok(Bytes::from(format!(
+                                                "data: {}\n\n",
+                                                json!({"choices":[{"delta":{"tool_calls":[{"index": tool_index_counter, "id": id, "type": "function", "function": {"name": name, "arguments": ""}}]},"index":0}]})
+                                            )));
+                                        }
+                                    }
+                                    "content_block_delta" => {
+                                        let delta = &event["delta"];
+                                        let delta_type = delta.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                                        if delta_type == "text_delta" {
+                                            let text = delta.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                                            if !text.is_empty() {
+                                                yield Ok(Bytes::from(format!(
+                                                    "data: {}\n\n",
+                                                    json!({"choices":[{"delta":{"content": text},"index":0}]})
+                                                )));
+                                            }
+                                        } else if delta_type == "input_json_delta" {
+                                            let partial = delta.get("partial_json").and_then(|p| p.as_str()).unwrap_or("");
+                                            if !partial.is_empty() {
+                                                yield Ok(Bytes::from(format!(
+                                                    "data: {}\n\n",
+                                                    json!({"choices":[{"delta":{"tool_calls":[{"index": tool_index_counter, "function": {"arguments": partial}}]},"index":0}]})
+                                                )));
+                                            }
+                                        }
+                                    }
+                                    "content_block_stop" => {
+                                        let idx = event.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
+                                        if idx > 0 || tool_index_counter > 0 {
+                                            tool_index_counter += 1;
+                                        }
+                                    }
+                                    "message_delta" => {
+                                        let stop = event["delta"].get("stop_reason").and_then(|r| r.as_str()).unwrap_or("end_turn");
+                                        let finish = match stop {
+                                            "tool_use" => "tool_calls",
+                                            "max_tokens" => "length",
+                                            _ => "stop",
+                                        };
+                                        yield Ok(Bytes::from(format!(
+                                            "data: {}\n\n",
+                                            json!({"choices":[{"delta":{},"finish_reason": finish,"index":0}]})
+                                        )));
+                                    }
+                                    "message_stop" => {
+                                        yield Ok(Bytes::from("data: [DONE]\n\n"));
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            if log_level <= LogLevel::Info {
+                println!("[{:06}] openai→anthropic stream {}ms", req_id, start.elapsed().as_millis());
+            }
+        };
+        (StatusCode::OK, headers, Body::from_stream(stream)).into_response()
+    } else {
+        let anthropic_resp: Value = match resp.json().await {
+            Ok(r) => r,
+            Err(e) => return error_response(502, &format!("Invalid response: {}", e)),
+        };
+        let openai_resp = anthropic_response_to_openai(&anthropic_resp);
+        state.log(LogLevel::Info, &format!("[{:06}] openai→anthropic {}ms", req_id, start.elapsed().as_millis()));
+        (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")],
+            serde_json::to_string(&openai_resp).unwrap_or_default()).into_response()
+    }
+}
+
 fn transform_openai(
     body: &[u8],
     model_map: &std::collections::HashMap<String, String>,
+    backend_type: &BackendType,
+    use_max_completion_tokens: bool,
 ) -> (Bytes, bool) {
     if body.is_empty() { return (Bytes::new(), false); }
     let mut data: Value = match serde_json::from_slice(body) { Ok(v) => v, Err(_) => return (Bytes::from(body.to_vec()), false) };
     let is_streaming = data.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
     if let Some(model) = data.get("model").and_then(|m| m.as_str()) {
-        let mapped = map_model(model, model_map);
+        let mapped = map_model(model, model_map, backend_type);
         data["model"] = Value::String(mapped);
     }
-    if let Some(mt) = data.get("max_tokens").cloned() { data["max_completion_tokens"] = mt; data.as_object_mut().map(|o| o.remove("max_tokens")); }
-    for key in ["reasoning", "reasoningBudgetTokens", "service_tier", "parallel_tool_calls", "logprobs", "seed"] {
-        data.as_object_mut().map(|o| o.remove(key));
+    match backend_type {
+        BackendType::Cortex => {
+            if let Some(mt) = data.get("max_tokens").cloned() { data["max_completion_tokens"] = mt; data.as_object_mut().map(|o| o.remove("max_tokens")); }
+            for key in ["reasoning", "reasoningBudgetTokens", "service_tier", "parallel_tool_calls", "logprobs", "seed"] {
+                data.as_object_mut().map(|o| o.remove(key));
+            }
+        }
+        _ if use_max_completion_tokens => {
+            if let Some(mt) = data.get("max_tokens").cloned() { data["max_completion_tokens"] = mt; data.as_object_mut().map(|o| o.remove("max_tokens")); }
+        }
+        BackendType::Ollama => {
+            for key in ["reasoning", "reasoningBudgetTokens", "service_tier", "parallel_tool_calls", "logprobs", "seed"] {
+                data.as_object_mut().map(|o| o.remove(key));
+            }
+        }
+        _ => {}
     }
     (Bytes::from(serde_json::to_vec(&data).unwrap_or_default()), is_streaming)
 }

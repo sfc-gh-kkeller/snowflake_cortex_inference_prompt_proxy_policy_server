@@ -23,6 +23,43 @@ timeout_secs = 300
 # Increase if making many concurrent requests
 connection_pool_size = 10
 
+# ============ Backend Selection ============
+# The [backend] section selects which LLM provider to route requests to.
+# If omitted, defaults to "cortex" (Snowflake Cortex) using the [snowflake] section.
+#
+# Supported types: "cortex" | "openai" | "anthropic" | "ollama"
+#
+# Any AI client (Anthropic or OpenAI format) can talk to any backend.
+# The proxy translates between formats automatically.
+
+# --- Option 1: Snowflake Cortex (default) ---
+# Omit [backend] entirely and configure [snowflake] below.
+
+# --- Option 2: OpenAI ---
+# [backend]
+# type = "openai"
+# base_url = "https://api.openai.com/v1"
+# api_key = "sk-..."
+# default_model = "gpt-4o"
+
+# --- Option 3: Anthropic ---
+# [backend]
+# type = "anthropic"
+# base_url = "https://api.anthropic.com"
+# api_key = "sk-ant-..."
+# default_model = "claude-sonnet-4-20250514"
+# anthropic_version = "2023-06-01"
+
+# --- Option 4: Ollama (local) ---
+# [backend]
+# type = "ollama"
+# base_url = "http://localhost:11434/v1"
+# default_model = "llama3.1"
+
+# ============ Snowflake Cortex ============
+# Required when backend is "cortex" (the default).
+# Omit when using a different backend.
+
 [snowflake]
 # Your Snowflake account's Cortex API URL
 # Format: https://<account>.snowflakecomputing.com/api/v2/cortex/v1
@@ -36,16 +73,17 @@ pat = "<YOUR_PAT>"
 # Available: claude-4-sonnet, claude-4-opus, claude-opus-4-5, claude-haiku-4-5, claude-3-5-sonnet
 default_model = "claude-opus-4-5"
 
-# Optional: explicit model mapping (client model -> Snowflake model)
+# Optional: explicit model mapping (client model -> backend model)
 # Useful if a client sends a different name or alias
 [model_map]
 # "claude-opus-4-5" = "claude-opus-4-5"
 # "claude-4-opus" = "claude-opus-4-5"
-# "claude-4-sonnet" = "claude-4-sonnet"
+# "gpt-4" = "claude-4-sonnet"
 
 # ============ Optional: Policy Enforcement ============
 # Omit this section entirely to run as a pure API proxy.
 # When enabled, prompts are evaluated against security rules before forwarding.
+# Works with ALL backends — the judge model calls the configured backend.
 
 # [policy]
 # enabled = true

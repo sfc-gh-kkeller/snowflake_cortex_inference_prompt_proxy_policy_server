@@ -1,21 +1,24 @@
 ## Snowflake Cortex AI Agent Compatibility Proxy
 
-A high-performance Rust proxy that lets any AI coding agent (Claude Code, OpenCode, ZeroClaw, Continue.dev, Mistral Vibe, etc.) use Snowflake Cortex AI models.
+A high-performance Rust proxy that lets any AI coding agent (Claude Code, OpenCode, ZeroClaw, Continue.dev, Mistral Vibe, etc.) use Snowflake Cortex AI models — or any other LLM backend (OpenAI, Anthropic, Ollama).
 
 ### What it does
 
-1. **API Translation** — Accepts requests in Anthropic or OpenAI format and translates them to Snowflake Cortex's API, so any AI tool can use Snowflake as its LLM backend without modification.
+1. **Universal API Translation** — Accepts requests in Anthropic or OpenAI format and translates them to any backend: Snowflake Cortex, OpenAI, Anthropic, or Ollama. Any AI client can talk to any LLM provider without modification.
 
-2. **Agent API Proxying** — Proxies Snowflake's Cortex Agent API (`/agent:run`), handling the PAT-to-session-token exchange automatically. Also provides translation endpoints that accept Anthropic or OpenAI format and route through the Agent API.
+2. **Multi-Backend Routing** — Configurable backend via `[backend]` section in config. Supports Snowflake Cortex (default), OpenAI, Anthropic, and Ollama. Switch backends by changing one line in your config.
 
-3. **Policy Enforcement (Optional)** — When enabled, intercepts prompts on **all routes** before they reach the LLM and evaluates them against configurable security policies. Uses a two-tier approach: fast pattern matching first, then a Cortex judge model for deeper evaluation. Blocks prompt injection, data exfiltration attempts, unauthorized tool use, and other threats. **Omit the `[policy]` section entirely to run as a pure API proxy with no policy overhead.**
+3. **Agent API Proxying** — Proxies Snowflake's Cortex Agent API (`/agent:run`), handling the PAT-to-session-token exchange automatically. Also provides translation endpoints that accept Anthropic or OpenAI format and route through the Agent API.
+
+4. **Policy Enforcement (Optional)** — When enabled, intercepts prompts on **all routes** before they reach the LLM and evaluates them against configurable security policies. Uses a two-tier approach: fast pattern matching first, then a judge model for deeper evaluation. Works with all backends. **Omit the `[policy]` section entirely to run as a pure API proxy with no policy overhead.**
 
 ### Why use this
 
-- Use any coding agent while centralizing inference in Snowflake Cortex
-- Keep AI and data governance in Snowflake Horizon catalog
+- Use any coding agent with **any LLM backend** — Cortex, OpenAI, Anthropic, or Ollama
+- **Swap backends instantly** — change one config line, no client-side changes needed
+- Centralize policy enforcement across all AI tools regardless of backend
+- Keep AI and data governance in Snowflake Horizon catalog (with Cortex backend)
 - Combine with Snowflake MCP server for native data access
-- Centralized billing across all Snowflake-supported models
 
 ![Architecture](architecture_ai_layer.png)
 
@@ -44,24 +47,20 @@ A high-performance Rust proxy that lets any AI coding agent (Claude Code, OpenCo
 │  └────────────────────────────────────────────────────────────────┘  │
 │                                                                      │
 │  ┌──────────────────────┐  ┌──────────────────────────────────────┐  │
-│  │  Format Translation  │  │  Authentication Layer                │  │
+│  │  Format Translation  │  │  Backend Routing (configurable)      │  │
 │  │                      │  │                                      │  │
-│  │  Anthropic → OpenAI  │  │  PAT → Bearer token (chat/compl.)   │  │
-│  │  OpenAI → OpenAI     │  │  PAT → Session token (agent:run)    │  │
-│  │  Anthropic → agent   │  │  Session passthrough (if provided)  │  │
-│  │  OpenAI → agent      │  │  Token caching with expiry          │  │
+│  │  Anthropic ⇄ OpenAI  │  │  [backend] type = cortex (default)   │  │
+│  │  OpenAI ⇄ Anthropic  │  │  [backend] type = openai             │  │
+│  │  Passthrough modes   │  │  [backend] type = anthropic           │  │
+│  │                      │  │  [backend] type = ollama              │  │
 │  └──────────────────────┘  └──────────────────────────────────────┘  │
-└─────────────────────────────────┬────────────────────────────────────┘
-                                  │
-                    ┌─────────────▼─────────────┐
-                    │  Snowflake Cortex APIs     │
-                    │                           │
-                    │  /api/v2/cortex/v1/       │
-                    │    chat/completions       │
-                    │                           │
-                    │  /api/v2/cortex/          │
-                    │    agent:run              │
-                    └───────────────────────────┘
+└──────────┬──────────────────┬──────────────────┬──────────────────────┘
+           │                  │                  │
+┌──────────▼──────┐ ┌────────▼────────┐ ┌───────▼───────┐
+│ Snowflake Cortex│ │ OpenAI / Ollama │ │   Anthropic   │
+│ /api/v2/cortex/ │ │ /v1/chat/       │ │ /v1/messages  │
+│ v1/chat/compl.  │ │ completions     │ │               │
+└─────────────────┘ └─────────────────┘ └───────────────┘
 ```
 
 ---
@@ -133,9 +132,65 @@ Steps:
 
 ### Configuration
 
-Create a config file (**do not commit your PAT**). Default location: `~/.config/cortex-proxy/config.toml`
+Create a config file (**do not commit your API keys**). Default location: `~/.config/cortex-proxy/config.toml`
 
-Sample `cortex-proxy.toml`:
+#### Backend Selection
+
+The proxy supports four backends. Set via `[backend]` section (defaults to Cortex if omitted):
+
+| Backend | `[backend] type` | What it does |
+|---|---|---|
+| **Snowflake Cortex** (default) | `cortex` | Routes to Snowflake Cortex AI — uses `[snowflake]` section for credentials |
+| **OpenAI** | `openai` | Routes to OpenAI API — any client format works |
+| **Anthropic** | `anthropic` | Routes to Anthropic API — any client format works |
+| **Ollama** | `ollama` | Routes to local Ollama instance — any client format works |
+
+**Translation matrix** — every combination works:
+
+| Client sends → | Cortex | OpenAI | Anthropic | Ollama |
+|---|---|---|---|---|
+| **Anthropic format** (`/v1/messages`) | A→O | A→O | Passthrough | A→O |
+| **OpenAI format** (`/chat/completions`) | O→O | Passthrough | O→A | Passthrough |
+
+Sample configs:
+
+**Snowflake Cortex (default — no `[backend]` needed):**
+```toml
+[snowflake]
+base_url = "https://<account>.snowflakecomputing.com/api/v2/cortex/v1"
+pat = "<YOUR_PAT>"
+default_model = "claude-opus-4-5"
+```
+
+**OpenAI:**
+```toml
+[backend]
+type = "openai"
+base_url = "https://api.openai.com/v1"
+api_key = "sk-..."
+default_model = "gpt-4o"
+```
+
+**Anthropic:**
+```toml
+[backend]
+type = "anthropic"
+base_url = "https://api.anthropic.com"
+api_key = "sk-ant-..."
+default_model = "claude-sonnet-4-20250514"
+```
+
+**Ollama (local):**
+```toml
+[backend]
+type = "ollama"
+base_url = "http://localhost:11434/v1"
+default_model = "llama3.1"
+```
+
+#### Full Cortex Config Example
+
+Sample `cortex-proxy.toml` (Cortex backend):
 
 ```toml
 [proxy]
@@ -272,16 +327,32 @@ The proxy detects this and skips the exchange.
 
 ### How the Translation Works
 
-#### Anthropic → Snowflake Cortex (`/v1/messages`)
+The proxy translates between client API format and backend API format automatically:
+
+#### Anthropic Client → OpenAI-compatible Backend (Cortex, OpenAI, Ollama)
 
 The proxy receives an Anthropic Messages API request and converts it to OpenAI `chat/completions` format:
 
 - `messages[].content` (string or content blocks) → OpenAI `messages[].content`
 - `system` → `messages[0].role = "system"`
 - `tool_use` / `tool_result` content blocks → OpenAI `tool_calls` / `tool` role messages
-- Response SSE: Snowflake returns OpenAI-format chunks, proxy passes them through
+- Response SSE: Backend returns OpenAI-format chunks, proxy converts back to Anthropic events
 
-#### Anthropic → Agent API (`/v1/messages/agent`)
+#### OpenAI Client → Anthropic Backend
+
+When the backend is Anthropic and the client sends OpenAI format, the proxy converts:
+
+- `messages[].role = "system"` → `system` top-level field
+- `tool_calls` on assistant messages → `tool_use` content blocks
+- `role: "tool"` messages → `tool_result` content blocks in a `user` message
+- Response: Anthropic SSE events are converted back to OpenAI `data:` chunks
+
+#### Passthrough Modes
+
+- **Anthropic client → Anthropic backend**: Forwarded as-is (model mapping + auth applied)
+- **OpenAI client → OpenAI/Ollama backend**: Forwarded as-is (model mapping + auth applied)
+
+#### Anthropic Client → Agent API (`/v1/messages/agent`)
 
 The proxy receives an Anthropic Messages API request, converts it to Cortex `agent:run` format, and maps the response SSE back:
 
@@ -313,7 +384,7 @@ Same pattern as above but with OpenAI format on both ends:
 
 ### Model Mapping
 
-The proxy maps client-requested model names to Snowflake Cortex model names. Default mappings are built in:
+The proxy maps client-requested model names to backend model names. For the Cortex backend, default mappings are built in:
 
 | Client Sends | Snowflake Gets |
 |---|---|
@@ -323,7 +394,7 @@ The proxy maps client-requested model names to Snowflake Cortex model names. Def
 | `claude-haiku-4-5`, `haiku` | `claude-haiku-4-5` |
 | Any unrecognized model | `claude-4-sonnet` (default) |
 
-Custom mappings can be added in the config:
+Custom mappings can be added in the config (works with all backends):
 
 ```toml
 [model_map]
@@ -331,11 +402,13 @@ Custom mappings can be added in the config:
 "gpt-4o" = "claude-opus-4-5"
 ```
 
+For non-Cortex backends, unrecognized models are passed through as-is (no default mapping).
+
 ---
 
 ### Policy Enforcement Engine (Optional)
 
-When enabled, the policy engine intercepts prompts on **all routes** (`/v1/messages`, `/v1/chat/completions`, `/agent:run`, `/v1/messages/agent`, `/v1/chat/completions/agent`, and wildcard) before forwarding to Snowflake. **Omit the `[policy]` section to disable entirely — no performance cost when disabled.**
+When enabled, the policy engine intercepts prompts on **all routes** (`/v1/messages`, `/v1/chat/completions`, `/agent:run`, `/v1/messages/agent`, `/v1/chat/completions/agent`, and wildcard) before forwarding to the backend. Works with **all backend types** — the judge model calls whichever backend is configured. **Omit the `[policy]` section to disable entirely — no performance cost when disabled.**
 
 #### How It Works
 
@@ -699,7 +772,7 @@ pixi run cargo build --release --manifest-path cortex-proxy-rs/Cargo.toml
 
 ```
 cortex-proxy-rs/           # Rust source
-├── src/main.rs            # All proxy logic (~1300 lines)
+├── src/main.rs            # All proxy logic (~1900 lines)
 ├── Cargo.toml
 ├── target/release/        # Compiled binary
 cortex-proxy.example.toml  # Template config
